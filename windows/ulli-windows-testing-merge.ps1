@@ -1859,6 +1859,20 @@ exit
 
             Start-Sleep -Seconds 5
         } elseif ($selectedStrategy -ne "use_free_all" -and -not $isOtherDrive) {
+            # ── power warning dialog ────────────────────────────
+            $powerConfirm = [System.Windows.Forms.MessageBox]::Show(
+                "Keep your computer plugged in!`n`n" +
+                "A partition resize is about to begin. Power loss during this process " +
+                "could corrupt your partition table.`n`n" +
+                "Make sure your computer is connected to AC power before continuing.",
+                "Power Requirement Warning",
+                [System.Windows.Forms.MessageBoxButtons]::OKCancel,
+                [System.Windows.Forms.MessageBoxIcon]::Warning
+            )
+            if ($powerConfirm -ne [System.Windows.Forms.DialogResult]::OK) {
+                return
+            }
+
             $shrinkAmountGB = if ($selectedStrategy -eq "use_free_boot") { $linuxSizeGB } else { $totalNeededGB }
 
             Set-Status "Shrinking C: partition..."
