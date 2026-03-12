@@ -413,8 +413,20 @@ class InstallerWindow(Gtk.ApplicationWindow):
     # ── init ──────────────────────────────────────────────────────────────────
     def __init__(self, **kw):
         super().__init__(title="ULLI USB-less Linux Installer", **kw)
-        self.set_default_size(760, 820)
-        self.set_resizable(False)
+
+        # Choose a default size that fits the screen
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor() or display.get_monitor(0)
+        geom = monitor.get_geometry()
+        scale = monitor.get_scale_factor()
+        scr_w, scr_h = geom.width * scale, geom.height * scale
+        self._scr_h = scr_h
+        if scr_h <= 900:
+            win_w, win_h = 700, min(scr_h - 80, 620)
+        else:
+            win_w, win_h = 760, 820
+        self.set_default_size(win_w, win_h)
+        self.set_resizable(True)
 
         self.selected_distro = "mint"
         self.custom_iso_path = ""
@@ -536,10 +548,17 @@ class InstallerWindow(Gtk.ApplicationWindow):
 
     # ── UI construction ───────────────────────────────────────────────────────
     def _build_ui(self):
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(outer)
+
+        main_scroll = Gtk.ScrolledWindow()
+        main_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        outer.pack_start(main_scroll, True, True, 0)
+
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         root.set_margin_start(16); root.set_margin_end(16)
         root.set_margin_top(16);   root.set_margin_bottom(16)
-        self.add(root)
+        main_scroll.add(root)
 
         # ── Header ──
         hdr = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
@@ -569,8 +588,11 @@ class InstallerWindow(Gtk.ApplicationWindow):
         # ── Log ──
         root.pack_start(self._build_log_group(), True, True, 10)
 
-        # ── Bottom bar ──
-        root.pack_start(self._build_bottom_bar(), False, False, 0)
+        # ── Bottom bar (always visible, outside scroll area) ──
+        bottom = self._build_bottom_bar()
+        bottom.set_margin_start(16); bottom.set_margin_end(16)
+        bottom.set_margin_bottom(16)
+        outer.pack_start(bottom, False, False, 0)
 
     def _group_frame(self, title):
         """Return (outer_box, inner_box)."""
@@ -834,14 +856,19 @@ class InstallerWindow(Gtk.ApplicationWindow):
             modal=True,
             destroy_with_parent=True,
         )
-        dialog.set_default_size(700, 680)
-        dialog.set_resizable(False)
+        dialog.set_default_size(700, min(680, self._scr_h - 140) if self._scr_h <= 900 else 680)
+        dialog.set_resizable(True)
 
-        content = dialog.get_content_area()
+        raw_content = dialog.get_content_area()
+        dialog_scroll = Gtk.ScrolledWindow()
+        dialog_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        raw_content.pack_start(dialog_scroll, True, True, 0)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         content.get_style_context().add_class("disk-plan")
-        content.set_spacing(8)
         content.set_margin_start(16); content.set_margin_end(16)
         content.set_margin_top(12); content.set_margin_bottom(8)
+        dialog_scroll.add(content)
 
         # Title
         title = Gtk.Label(label=f"Review Disk Changes for {distro_label}", xalign=0)
@@ -899,7 +926,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
         layout_text.set_monospace(True)
         layout_text.set_wrap_mode(Gtk.WrapMode.NONE)
         layout_scroll = Gtk.ScrolledWindow()
-        layout_scroll.set_min_content_height(120)
+        layout_scroll.set_min_content_height(80)
         layout_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         layout_scroll.add(layout_text)
         layout_frame.add(layout_scroll)
@@ -925,7 +952,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
         changes_text.set_editable(False); changes_text.set_cursor_visible(False)
         changes_text.set_monospace(True)
         changes_scroll = Gtk.ScrolledWindow()
-        changes_scroll.set_min_content_height(90)
+        changes_scroll.set_min_content_height(60)
         changes_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         changes_scroll.add(changes_text)
         changes_frame.add(changes_scroll)
@@ -937,7 +964,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
         after_text.set_editable(False); after_text.set_cursor_visible(False)
         after_text.set_monospace(True)
         after_scroll = Gtk.ScrolledWindow()
-        after_scroll.set_min_content_height(100)
+        after_scroll.set_min_content_height(60)
         after_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         after_scroll.add(after_text)
         after_frame.add(after_scroll)
