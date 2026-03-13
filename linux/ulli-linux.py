@@ -17,21 +17,45 @@ Requirements:
 
 import os, sys
 
-# Suppress dconf/ibus/proxy warnings when running as root (must be set before GTK import)
-_is_root = os.geteuid() == 0
-if _is_root:
-    os.environ["GSETTINGS_BACKEND"] = "memory"
-    os.environ["GTK_IM_MODULE"] = ""
-    os.environ["NO_AT_BRIDGE"] = "1"
-    # Redirect fd 2 to /dev/null — C libraries (GDBus, ibus) write warnings
-    # directly to the file descriptor, bypassing Python's sys.stderr.
-    # Python's own stderr is preserved for our code via sys.stderr.
-    _saved_stderr_fd = os.dup(2)
-    _devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(_devnull, 2)
-    os.close(_devnull)
-    # Rewire Python's sys.stderr to the saved real fd so print(..., file=sys.stderr) still works
-    sys.stderr = os.fdopen(_saved_stderr_fd, "w", closefd=False)
+# ─── root helper mode ────────────────────────────────────────────────────────
+# When invoked with --root-helper, run as a JSON-RPC subprocess that executes
+# privileged commands on behalf of the unprivileged GUI process.
+if "--root-helper" in sys.argv:
+    import json as _json, subprocess as _sp
+    for _line in sys.stdin:
+        try:
+            _req = _json.loads(_line)
+        except _json.JSONDecodeError:
+            continue
+        _t = _req.get("type")
+        try:
+            if _t == "run":
+                _r = _sp.run(_req["cmd"], capture_output=True, text=True,
+                             input=_req.get("input"))
+                _resp = {"rc": _r.returncode,
+                         "out": _r.stdout or "", "err": _r.stderr or ""}
+            elif _t == "mkdir":
+                os.makedirs(_req["path"], exist_ok=True)
+                _resp = {"rc": 0}
+            elif _t == "read":
+                with open(_req["path"], "r", errors="replace") as _f:
+                    _resp = {"rc": 0, "content": _f.read()}
+            elif _t == "write":
+                with open(_req["path"], "w") as _f:
+                    _f.write(_req["content"])
+                _resp = {"rc": 0}
+            elif _t == "unlink":
+                os.unlink(_req["path"])
+                _resp = {"rc": 0}
+            elif _t == "exists":
+                _resp = {"rc": 0, "exists": os.path.exists(_req["path"])}
+            else:
+                _resp = {"rc": 1, "err": f"unknown request type: {_t}"}
+        except Exception as _e:
+            _resp = {"rc": 1, "err": str(_e)}
+        sys.stdout.write(_json.dumps(_resp) + "\n")
+        sys.stdout.flush()
+    sys.exit(0)
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -42,6 +66,8 @@ import subprocess, threading, hashlib, shutil, json, time, signal, re
 import urllib.request, urllib.error
 from pathlib import Path
 from datetime import datetime
+
+_is_root = os.geteuid() == 0
 
 # ─── constants ───────────────────────────────────────────────────────────────
 
@@ -111,10 +137,103 @@ DISTROS = {
     },
 }
 
+# ─── privileged helper ────────────────────────────────────────────────────────
+
+class PrivilegedHelper:
+    """Persistent root subprocess for running privileged operations.
+
+    Spawned once via ``pkexec`` when the first privileged call is made.
+    The GUI stays unprivileged; only disk operations cross the privilege
+    boundary through this JSON-over-pipes channel.
+    """
+    _instance = None
+
+    @classmethod
+    def get(cls):
+        """Return the singleton helper, spawning it on first call."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    @classmethod
+    def running(cls):
+        return cls._instance is not None
+
+    def __init__(self):
+        script = os.path.abspath(sys.argv[0])
+        try:
+            self.proc = subprocess.Popen(
+                ["pkexec", sys.executable, script, "--root-helper"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                text=True,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                "pkexec not found. Install polkit:\n"
+                "  Debian/Ubuntu:  sudo apt install policykit-1\n"
+                "  Fedora/RHEL:    sudo dnf install polkit\n"
+                "  Arch/CachyOS:   sudo pacman -S polkit")
+        # Verify the helper started (pkexec may have been cancelled)
+        if self.proc.poll() is not None:
+            raise RuntimeError(
+                "Authentication cancelled or failed. "
+                "Root privileges are required for disk operations.")
+
+    # — command execution —
+
+    def _send(self, req):
+        self.proc.stdin.write(json.dumps(req) + "\n")
+        self.proc.stdin.flush()
+        line = self.proc.stdout.readline()
+        if not line:
+            raise RuntimeError(
+                "Privileged helper died unexpectedly. "
+                "Authentication may have been cancelled.")
+        return json.loads(line)
+
+    def run(self, cmd, input_data=None):
+        """Run *cmd* as root, return (returncode, stdout, stderr)."""
+        req = {"type": "run", "cmd": cmd}
+        if input_data is not None:
+            req["input"] = input_data
+        resp = self._send(req)
+        return resp["rc"], (resp.get("out") or "").strip(), (resp.get("err") or "").strip()
+
+    # — file helpers —
+
+    def makedirs(self, path):
+        self._send({"type": "mkdir", "path": str(path)})
+
+    def read_file(self, path):
+        resp = self._send({"type": "read", "path": str(path)})
+        return resp.get("content", "")
+
+    def write_file(self, path, content):
+        self._send({"type": "write", "path": str(path), "content": content})
+
+    def unlink(self, path):
+        self._send({"type": "unlink", "path": str(path)})
+
+    def exists(self, path):
+        resp = self._send({"type": "exists", "path": str(path)})
+        return resp.get("exists", False)
+
+    def close(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.stdin.close()
+            self.proc.wait()
+
 # ─── helpers ─────────────────────────────────────────────────────────────────
 
 def run(cmd, **kw):
-    """Run a command, return (returncode, stdout, stderr)."""
+    """Run a command, return (returncode, stdout, stderr).
+
+    When the process is unprivileged, commands are transparently forwarded
+    to the persistent root helper spawned via pkexec.
+    """
+    if not _is_root:
+        helper = PrivilegedHelper.get()
+        return helper.run(cmd, input_data=kw.get("input"))
     kw.setdefault("capture_output", True)
     kw.setdefault("text", True)
     r = subprocess.run(cmd, **kw)
@@ -156,6 +275,35 @@ def get_partition_info(device):
         return None, None
     vals = lines[-1].split()
     return int(vals[0]), int(vals[1])
+
+def priv_makedirs(path):
+    """Create directory as root if not already privileged."""
+    if _is_root:
+        os.makedirs(path, exist_ok=True)
+    else:
+        PrivilegedHelper.get().makedirs(path)
+
+def priv_read_file(path):
+    """Read a file, using the root helper if unprivileged."""
+    if _is_root:
+        with open(path, "r", errors="replace") as f:
+            return f.read()
+    return PrivilegedHelper.get().read_file(path)
+
+def priv_write_file(path, content):
+    """Write a file, using the root helper if unprivileged."""
+    if _is_root:
+        with open(path, "w") as f:
+            f.write(content)
+    else:
+        PrivilegedHelper.get().write_file(path, content)
+
+def priv_unlink(path):
+    """Remove a file, using the root helper if unprivileged."""
+    if _is_root:
+        os.unlink(path)
+    else:
+        PrivilegedHelper.get().unlink(path)
 
 def bytes_to_gb(b):
     return round(b / 1e9, 2)
@@ -446,7 +594,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
         self._apply_css()
         self._build_ui()
         self.show_all()
-        GLib.idle_add(self._refresh_disk_info)
+        threading.Thread(target=self._refresh_disk_info, daemon=True).start()
 
     # ── CSS ───────────────────────────────────────────────────────────────────
     def _apply_css(self):
@@ -745,6 +893,14 @@ class InstallerWindow(Gtk.ApplicationWindow):
 
     # ── disk info ─────────────────────────────────────────────────────────────
     def _refresh_disk_info(self):
+        try:
+            return self._refresh_disk_info_inner()
+        except RuntimeError as e:
+            self._ui_set_disk_info(
+                f"Root privileges required:\n{e}",
+                "Cannot proceed without authentication.", "strategy-none")
+
+    def _refresh_disk_info_inner(self):
         self.fs_info = get_root_fs_info()
         if not self.fs_info:
             self._ui_set_disk_info("Could not detect root filesystem", None, None)
@@ -787,14 +943,16 @@ class InstallerWindow(Gtk.ApplicationWindow):
         self._ui_set_disk_info(text, strat, sc)
 
     def _ui_set_disk_info(self, text, strat, style_class):
-        self.disk_info_label.set_text(text)
-        ctx = self.strategy_label.get_style_context()
-        for c in ["strategy-btrfs", "strategy-none"]:
-            ctx.remove_class(c)
-        if strat:
-            self.strategy_label.set_text(strat)
-            if style_class:
-                ctx.add_class(style_class)
+        def _update():
+            self.disk_info_label.set_text(text)
+            ctx = self.strategy_label.get_style_context()
+            for c in ["strategy-btrfs", "strategy-none"]:
+                ctx.remove_class(c)
+            if strat:
+                self.strategy_label.set_text(strat)
+                if style_class:
+                    ctx.add_class(style_class)
+        GLib.idle_add(_update)
 
     # ── logging ───────────────────────────────────────────────────────────────
     def log(self, msg, error=False):
@@ -1410,12 +1568,6 @@ class InstallerWindow(Gtk.ApplicationWindow):
         self.log("Linux Live Installer starting")
         self.log("=" * 52)
 
-        # ── 0. root check ──────────────────────────────────────────────────
-        if os.geteuid() != 0:
-            self.log("ERROR: installer must be run as root (sudo).", error=True)
-            self.log("Re-launch with:  sudo python3 linux_installer.py", error=True)
-            self.set_status("Please restart as root (sudo).")
-            return
 
         # ── 1. gather info ─────────────────────────────────────────────────
         self.fs_info = get_root_fs_info()
@@ -1632,23 +1784,21 @@ class InstallerWindow(Gtk.ApplicationWindow):
         self.set_status("Shrinking partition…")
 
         sfdisk_script = f"{part_num}: size={new_size_sectors}\n"
-        result = subprocess.run(
+        rc, _, sfdisk_err = run(
             ["sfdisk", "--no-reread", "-N", str(part_num), disk_dev],
-            input=sfdisk_script, capture_output=True, text=True,
+            input=sfdisk_script,
         )
-        if result.returncode != 0:
-            self.log(f"sfdisk resize failed: {result.stderr.strip()}", error=True)
+        if rc != 0:
+            self.log(f"sfdisk resize failed: {sfdisk_err}", error=True)
             self.log("Trying parted fallback…")
-            env = os.environ.copy()
-            env["LANG"] = "C"
-            env["LC_ALL"] = "C"
-            result2 = subprocess.run(
-                ["parted", "---pretend-input-tty", "-s", "--", disk_dev,
+            rc2, _, parted_err = run(
+                ["env", "LANG=C", "LC_ALL=C",
+                 "parted", "---pretend-input-tty", "-s", "--", disk_dev,
                  "resizepart", str(part_num), f"{new_part_end_mib}MiB"],
-                input="Yes\n", capture_output=True, text=True, env=env,
+                input="Yes\n",
             )
-            if result2.returncode != 0:
-                self.log(f"Partition resize failed: {result2.stderr.strip()}", error=True)
+            if rc2 != 0:
+                self.log(f"Partition resize failed: {parted_err}", error=True)
                 return None
 
         run(["partprobe", disk_dev])
@@ -1740,7 +1890,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
             return False
 
         mnt = "/mnt/linux_installer_boot"
-        os.makedirs(mnt, exist_ok=True)
+        priv_makedirs(mnt)
         run(["mount", boot_dev, mnt])
         try:
             ok = self._copy_iso_to_mount(iso_path, mnt, distro, distro_key)
@@ -1938,7 +2088,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
         code, mnt_out, _ = run(["findmnt", "-n", "-o", "TARGET", dev])
         if code != 0 or not mnt_out.strip():
             tmp_mnt = "/mnt/linux_installer_shrink_target"
-            os.makedirs(tmp_mnt, exist_ok=True)
+            priv_makedirs(tmp_mnt)
             code, _, err = run(["mount", dev, tmp_mnt])
             if code != 0:
                 self.log(f"Cannot mount {dev}: {err}", error=True)
@@ -2302,11 +2452,11 @@ class InstallerWindow(Gtk.ApplicationWindow):
         udisks_was_running = False
 
         try:
-            os.makedirs("/run/udev/rules.d", exist_ok=True)
-            with open(udev_rule_path, "w") as f:
-                f.write(
-                    f'SUBSYSTEM=="block", KERNEL=="{disk_basename}*", '
-                    f'ENV{{UDISKS_IGNORE}}="1", ENV{{UDISKS_AUTO}}="0"\n')
+            priv_makedirs("/run/udev/rules.d")
+            udev_content = (
+                f'SUBSYSTEM=="block", KERNEL=="{disk_basename}*", '
+                f'ENV{{UDISKS_IGNORE}}="1", ENV{{UDISKS_AUTO}}="0"\n')
+            priv_write_file(udev_rule_path, udev_content)
             run(["udevadm", "control", "--reload-rules"])
             udev_rule_installed = True
             self.log("Automount inhibit udev rule installed.")
@@ -2475,7 +2625,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
             # Always remove the udev inhibit rule and restart udisks2
             if udev_rule_installed:
                 try:
-                    os.unlink(udev_rule_path)
+                    priv_unlink(udev_rule_path)
                     run(["udevadm", "control", "--reload-rules"])
                     self.log("Automount inhibit rule removed.")
                 except Exception:
@@ -2486,7 +2636,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
 
         # Mount and copy ISO to boot partition
         mnt = "/mnt/linux_installer_boot"
-        os.makedirs(mnt, exist_ok=True)
+        priv_makedirs(mnt)
         run(["mount", boot_dev, mnt])
         try:
             ok = self._copy_iso_to_mount(iso_path, mnt, distro, distro_key)
@@ -2518,7 +2668,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
     def _copy_iso_to_mount(self, iso_path, mnt, distro, distro_key):
         """Mount ISO read-only and rsync its contents to mnt."""
         iso_mnt = "/mnt/linux_installer_iso_copy"
-        os.makedirs(iso_mnt, exist_ok=True)
+        priv_makedirs(iso_mnt)
 
         hybrid = distro.get("hybrid", False)
 
@@ -2587,13 +2737,11 @@ class InstallerWindow(Gtk.ApplicationWindow):
         for p in cfg_files:
             if not os.path.exists(p):
                 continue
-            with open(p, "r", errors="replace") as f:
-                content = f.read()
+            content = priv_read_file(p)
             patched = re.sub(r"(root=live:(?:CD)?LABEL=)(\S+)", rf"\g<1>{label}", content)
             patched = re.sub(r"(set isolabel=)(\S+)", rf"\g<1>{label}", patched)
             if patched != content:
-                with open(p, "w") as f:
-                    f.write(patched)
+                priv_write_file(p, patched)
                 self.log(f"  Patched: {Path(p).name}")
 
     def _update_grub(self):
@@ -2683,7 +2831,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
 
         # Find the EFI bootloader on the boot partition
         mnt = "/mnt/linux_installer_efi_check"
-        os.makedirs(mnt, exist_ok=True)
+        priv_makedirs(mnt)
         code, _, _ = run(["mount", "-o", "ro", boot_part_dev, mnt])
         if code != 0:
             # It might already be mounted from the copy step
@@ -2877,58 +3025,6 @@ def check_deps():
     return missing
 
 
-def ensure_root():
-    """Re-launch the script as root via pkexec if not already elevated.
-
-    pkexec provides a graphical (Polkit) password dialog, which fits
-    naturally into the GTK workflow.  The current process is replaced
-    seamlessly — from the user's perspective the app simply asks for
-    their password and continues.
-
-    Environment variables DISPLAY and XAUTHORITY (or WAYLAND_DISPLAY)
-    are forwarded so the GTK window can still open under the user's
-    desktop session.
-    """
-    if os.geteuid() == 0:
-        return  # already root
-
-    # Build the command: pkexec env <display‑vars> python3 this_script.py <args>
-    # pkexec sanitises the environment, so we must explicitly pass
-    # the display variables needed for the GUI to work.
-    env_vars = []
-    for var in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY",
-                "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
-                "HOME", "XDG_CONFIG_HOME", "DCONF_PROFILE"):
-        val = os.environ.get(var)
-        if val:
-            env_vars.append(f"{var}={val}")
-    # Suppress GTK warnings about dconf/ibus/a11y when running as root
-    env_vars.append("GSETTINGS_BACKEND=memory")
-    env_vars.append("GTK_IM_MODULE=none")
-    env_vars.append("NO_AT_BRIDGE=1")
-
-    cmd = ["pkexec", "env"] + env_vars + [sys.executable] + sys.argv
-
-    try:
-        os.execvp("pkexec", cmd)
-    except Exception as e:
-        # If pkexec is missing or the user cancels, fall back to sudo
-        print(f"pkexec failed ({e}), trying sudo…")
-        cmd_sudo = ["sudo",
-                    "GSETTINGS_BACKEND=memory", "GTK_IM_MODULE=none",
-                    "NO_AT_BRIDGE=1",
-                    "--preserve-env=DISPLAY,XAUTHORITY,WAYLAND_DISPLAY,"
-                    "XDG_RUNTIME_DIR,DBUS_SESSION_BUS_ADDRESS,"
-                    "HOME,XDG_CONFIG_HOME,DCONF_PROFILE",
-                    sys.executable] + sys.argv
-        try:
-            os.execvp("sudo", cmd_sudo)
-        except Exception as e2:
-            print(f"Could not obtain root privileges: {e2}", file=sys.stderr)
-            print("Please re-run with:  sudo python3 " + " ".join(sys.argv))
-            sys.exit(1)
-
-
 if __name__ == "__main__":
     if "--check-deps" in sys.argv:
         m = check_deps()
@@ -2947,8 +3043,6 @@ if __name__ == "__main__":
         else:
             print("All dependencies satisfied.")
         sys.exit(0)
-
-    ensure_root()
 
     app = InstallerApp()
     signal.signal(signal.SIGINT, signal.SIG_DFL)
