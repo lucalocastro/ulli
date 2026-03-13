@@ -17,21 +17,45 @@ Requirements:
 
 import os, sys
 
-# Suppress dconf/ibus/proxy warnings when running as root (must be set before GTK import)
-_is_root = os.geteuid() == 0
-if _is_root:
-    os.environ["GSETTINGS_BACKEND"] = "memory"
-    os.environ["GTK_IM_MODULE"] = ""
-    os.environ["NO_AT_BRIDGE"] = "1"
-    # Redirect fd 2 to /dev/null — C libraries (GDBus, ibus) write warnings
-    # directly to the file descriptor, bypassing Python's sys.stderr.
-    # Python's own stderr is preserved for our code via sys.stderr.
-    _saved_stderr_fd = os.dup(2)
-    _devnull = os.open(os.devnull, os.O_WRONLY)
-    os.dup2(_devnull, 2)
-    os.close(_devnull)
-    # Rewire Python's sys.stderr to the saved real fd so print(..., file=sys.stderr) still works
-    sys.stderr = os.fdopen(_saved_stderr_fd, "w", closefd=False)
+# ─── root helper mode ────────────────────────────────────────────────────────
+# When invoked with --root-helper, run as a JSON-RPC subprocess that executes
+# privileged commands on behalf of the unprivileged GUI process.
+if "--root-helper" in sys.argv:
+    import json as _json, subprocess as _sp
+    for _line in sys.stdin:
+        try:
+            _req = _json.loads(_line)
+        except _json.JSONDecodeError:
+            continue
+        _t = _req.get("type")
+        try:
+            if _t == "run":
+                _r = _sp.run(_req["cmd"], capture_output=True, text=True,
+                             input=_req.get("input"))
+                _resp = {"rc": _r.returncode,
+                         "out": _r.stdout or "", "err": _r.stderr or ""}
+            elif _t == "mkdir":
+                os.makedirs(_req["path"], exist_ok=True)
+                _resp = {"rc": 0}
+            elif _t == "read":
+                with open(_req["path"], "r", errors="replace") as _f:
+                    _resp = {"rc": 0, "content": _f.read()}
+            elif _t == "write":
+                with open(_req["path"], "w") as _f:
+                    _f.write(_req["content"])
+                _resp = {"rc": 0}
+            elif _t == "unlink":
+                os.unlink(_req["path"])
+                _resp = {"rc": 0}
+            elif _t == "exists":
+                _resp = {"rc": 0, "exists": os.path.exists(_req["path"])}
+            else:
+                _resp = {"rc": 1, "err": f"unknown request type: {_t}"}
+        except Exception as _e:
+            _resp = {"rc": 1, "err": str(_e)}
+        sys.stdout.write(_json.dumps(_resp) + "\n")
+        sys.stdout.flush()
+    sys.exit(0)
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -43,11 +67,14 @@ import urllib.request, urllib.error
 from pathlib import Path
 from datetime import datetime
 
+_is_root = os.geteuid() == 0
+
 # ─── constants ───────────────────────────────────────────────────────────────
 
 MIN_BOOT_GB   = 7
 MIN_LINUX_GB  = 20
-GiB           = 1_073_741_824
+MiB           = 1_048_576          # 1 MiB in bytes  (2^20)
+GiB           = 1_073_741_824      # 1 GiB in bytes  (2^30)
 
 DISTROS = {
     "mint": {
@@ -110,10 +137,131 @@ DISTROS = {
     },
 }
 
+# ─── unit conversion helpers ─────────────────────────────────────────────────
+#
+# User-facing sizes are in decimal GB (base-10) for familiarity.
+# All internal arithmetic uses MiB (base-2) since parted, sfdisk,
+# and the kernel partition table all work in MiB-aligned units.
+# btrfs resize targets are derived from MiB values (mib * MiB) so that
+# the filesystem and partition table always agree on the exact byte count.
+
+def gb_to_mib(gb):
+    """Convert user-facing decimal GB to MiB (rounded DOWN to avoid over-allocation)."""
+    return int(gb * 1_000_000_000 / MiB)
+
+def mib_to_bytes(mib):
+    """Convert MiB to exact byte count. Used for btrfs/ext resize targets."""
+    return mib * MiB
+
+def mib_to_display_gb(mib):
+    """Convert MiB to a human-friendly decimal GB string value."""
+    return round(mib * MiB / 1_000_000_000, 2)
+
+def bytes_to_display_gb(b):
+    """Convert bytes to human-friendly decimal GB for display."""
+    return round(b / 1_000_000_000, 2)
+
+def bytes_to_mib(b):
+    """Convert bytes to MiB (rounded DOWN)."""
+    return int(b / MiB)
+
+# ─── privileged helper ────────────────────────────────────────────────────────
+
+class PrivilegedHelper:
+    """Persistent root subprocess for running privileged operations.
+
+    Spawned once via ``pkexec`` when the first privileged call is made.
+    The GUI stays unprivileged; only disk operations cross the privilege
+    boundary through this JSON-over-pipes channel.
+    """
+    _instance = None
+
+    @classmethod
+    def get(cls):
+        """Return the singleton helper, spawning it on first call."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    @classmethod
+    def running(cls):
+        return cls._instance is not None
+
+    def __init__(self):
+        script = os.path.abspath(sys.argv[0])
+        try:
+            self.proc = subprocess.Popen(
+                ["pkexec", sys.executable, script, "--root-helper"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                text=True,
+            )
+        except FileNotFoundError:
+            raise RuntimeError(
+                "pkexec not found. Install polkit:\n"
+                "  Debian/Ubuntu:  sudo apt install policykit-1\n"
+                "  Fedora/RHEL:    sudo dnf install polkit\n"
+                "  Arch/CachyOS:   sudo pacman -S polkit")
+        # Verify the helper started (pkexec may have been cancelled)
+        if self.proc.poll() is not None:
+            raise RuntimeError(
+                "Authentication cancelled or failed. "
+                "Root privileges are required for disk operations.")
+
+    # — command execution —
+
+    def _send(self, req):
+        self.proc.stdin.write(json.dumps(req) + "\n")
+        self.proc.stdin.flush()
+        line = self.proc.stdout.readline()
+        if not line:
+            raise RuntimeError(
+                "Privileged helper died unexpectedly. "
+                "Authentication may have been cancelled.")
+        return json.loads(line)
+
+    def run(self, cmd, input_data=None):
+        """Run *cmd* as root, return (returncode, stdout, stderr)."""
+        req = {"type": "run", "cmd": cmd}
+        if input_data is not None:
+            req["input"] = input_data
+        resp = self._send(req)
+        return resp["rc"], (resp.get("out") or "").strip(), (resp.get("err") or "").strip()
+
+    # — file helpers —
+
+    def makedirs(self, path):
+        self._send({"type": "mkdir", "path": str(path)})
+
+    def read_file(self, path):
+        resp = self._send({"type": "read", "path": str(path)})
+        return resp.get("content", "")
+
+    def write_file(self, path, content):
+        self._send({"type": "write", "path": str(path), "content": content})
+
+    def unlink(self, path):
+        self._send({"type": "unlink", "path": str(path)})
+
+    def exists(self, path):
+        resp = self._send({"type": "exists", "path": str(path)})
+        return resp.get("exists", False)
+
+    def close(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.stdin.close()
+            self.proc.wait()
+
 # ─── helpers ─────────────────────────────────────────────────────────────────
 
 def run(cmd, **kw):
-    """Run a command, return (returncode, stdout, stderr)."""
+    """Run a command, return (returncode, stdout, stderr).
+
+    When the process is unprivileged, commands are transparently forwarded
+    to the persistent root helper spawned via pkexec.
+    """
+    if not _is_root:
+        helper = PrivilegedHelper.get()
+        return helper.run(cmd, input_data=kw.get("input"))
     kw.setdefault("capture_output", True)
     kw.setdefault("text", True)
     r = subprocess.run(cmd, **kw)
@@ -136,7 +284,7 @@ def get_root_fs_info():
     return {"device": device, "fstype": parts[1], "mountpoint": parts[2]}
 
 def get_partition_info(device):
-    """Return size_bytes, free_bytes for the filesystem on device."""
+    """Return (size_bytes, free_bytes) for the filesystem on device."""
     # Strip btrfs subvolume suffix like [/@] from device path
     clean_dev = device.split("[")[0] if "[" in device else device
     code, out, _ = run(["df", "--block-size=1", "--output=size,avail", clean_dev])
@@ -156,8 +304,34 @@ def get_partition_info(device):
     vals = lines[-1].split()
     return int(vals[0]), int(vals[1])
 
-def bytes_to_gb(b):
-    return round(b / 1e9, 2)
+def priv_makedirs(path):
+    """Create directory as root if not already privileged."""
+    if _is_root:
+        os.makedirs(path, exist_ok=True)
+    else:
+        PrivilegedHelper.get().makedirs(path)
+
+def priv_read_file(path):
+    """Read a file, using the root helper if unprivileged."""
+    if _is_root:
+        with open(path, "r", errors="replace") as f:
+            return f.read()
+    return PrivilegedHelper.get().read_file(path)
+
+def priv_write_file(path, content):
+    """Write a file, using the root helper if unprivileged."""
+    if _is_root:
+        with open(path, "w") as f:
+            f.write(content)
+    else:
+        PrivilegedHelper.get().write_file(path, content)
+
+def priv_unlink(path):
+    """Remove a file, using the root helper if unprivileged."""
+    if _is_root:
+        os.unlink(path)
+    else:
+        PrivilegedHelper.get().unlink(path)
 
 def sha256_file(path, progress_cb=None):
     h = hashlib.sha256()
@@ -319,11 +493,11 @@ def get_disk_layout_text(disk_path):
     parts, label, total_mib = get_disk_partitions(disk_path)
     lines = []
     if not parts:
-        lines.append(f"  [Empty disk]  {round(total_mib / 1024, 2)} GB")
+        lines.append(f"  [Empty disk]  {mib_to_display_gb(total_mib)} GB")
         return lines
 
     for p in parts:
-        size_gb = round(p["size_mib"] / 1024, 2)
+        size_gb = mib_to_display_gb(p["size_mib"])
         if p["is_free"]:
             if size_gb > 0.01:
                 lines.append(f"  [Unallocated]             {size_gb} GB")
@@ -350,7 +524,7 @@ def get_disk_layout_text(disk_path):
             mountpoint = mnt_out.strip()
             total, free = get_partition_usage(dev_path)
             if total and free:
-                mount_info = f"  [mounted: {mountpoint}, Free: {round(free / 1e9, 2)} GB]"
+                mount_info = f"  [mounted: {mountpoint}, Free: {bytes_to_display_gb(free)} GB]"
             else:
                 mount_info = f"  [mounted: {mountpoint}]"
 
@@ -437,7 +611,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
         self._apply_css()
         self._build_ui()
         self.show_all()
-        GLib.idle_add(self._refresh_disk_info)
+        threading.Thread(target=self._refresh_disk_info, daemon=True).start()
 
     # ── CSS ───────────────────────────────────────────────────────────────────
     def _apply_css(self):
@@ -736,6 +910,14 @@ class InstallerWindow(Gtk.ApplicationWindow):
 
     # ── disk info ─────────────────────────────────────────────────────────────
     def _refresh_disk_info(self):
+        try:
+            return self._refresh_disk_info_inner()
+        except RuntimeError as e:
+            self._ui_set_disk_info(
+                f"Root privileges required:\n{e}",
+                "Cannot proceed without authentication.", "strategy-none")
+
+    def _refresh_disk_info_inner(self):
         self.fs_info = get_root_fs_info()
         if not self.fs_info:
             self._ui_set_disk_info("Could not detect root filesystem", None, None)
@@ -745,8 +927,8 @@ class InstallerWindow(Gtk.ApplicationWindow):
         fstype = self.fs_info["fstype"]
         total, free = get_partition_info(dev)
 
-        total_gb = bytes_to_gb(total) if total else "?"
-        free_gb  = bytes_to_gb(free)  if free  else "?"
+        total_gb = bytes_to_display_gb(total) if total else "?"
+        free_gb  = bytes_to_display_gb(free)  if free  else "?"
 
         text = (
             f"Device:     {dev}\n"
@@ -778,14 +960,16 @@ class InstallerWindow(Gtk.ApplicationWindow):
         self._ui_set_disk_info(text, strat, sc)
 
     def _ui_set_disk_info(self, text, strat, style_class):
-        self.disk_info_label.set_text(text)
-        ctx = self.strategy_label.get_style_context()
-        for c in ["strategy-btrfs", "strategy-none"]:
-            ctx.remove_class(c)
-        if strat:
-            self.strategy_label.set_text(strat)
-            if style_class:
-                ctx.add_class(style_class)
+        def _update():
+            self.disk_info_label.set_text(text)
+            ctx = self.strategy_label.get_style_context()
+            for c in ["strategy-btrfs", "strategy-none"]:
+                ctx.remove_class(c)
+            if strat:
+                self.strategy_label.set_text(strat)
+                if style_class:
+                    ctx.add_class(style_class)
+        GLib.idle_add(_update)
 
     # ── logging ───────────────────────────────────────────────────────────────
     def log(self, msg, error=False):
@@ -813,10 +997,12 @@ class InstallerWindow(Gtk.ApplicationWindow):
     # ── disk plan dialog ────────────────────────────────────────────────────
     def _show_disk_plan(self, distro_label):
         """Show a GTK dialog with disk selection, size, before/after layout, strategy.
-        Returns dict with approved, strategy, target_disk, shrink_dev, shrink_gb, linux_gb
-        or None if cancelled. Must be called on the GTK main thread."""
+        Returns dict with approved, strategy, target_disk, shrink_dev, shrink_mib, linux_mib
+        or None if cancelled. Must be called on the GTK main thread.
+        
+        All internal sizes are in MiB. User-facing display uses decimal GB."""
 
-        boot_gb = MIN_BOOT_GB
+        boot_mib = gb_to_mib(MIN_BOOT_GB)
 
         # Gather disk info
         all_disks = get_all_disks()
@@ -832,9 +1018,9 @@ class InstallerWindow(Gtk.ApplicationWindow):
         # Build disk list
         disk_entries = []
         for d in all_disks:
-            size_gb = round(d["size_bytes"] / 1e9, 1)
+            size_gb = bytes_to_display_gb(d["size_bytes"])
             free_mib = get_disk_unallocated_mib(d["path"])
-            free_gb = round(free_mib / 1024, 1)
+            free_gb = mib_to_display_gb(free_mib)
             is_root = (d["path"] == root_disk_path)
             prefix = f"{d['name']} (current OS)" if is_root else d["name"]
             model = d["model"] or "Disk"
@@ -845,6 +1031,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
                 "label": label,
                 "is_root": is_root,
                 "size_gb": size_gb,
+                "size_mib": bytes_to_mib(d["size_bytes"]),
                 "free_gb": free_gb,
                 "free_mib": free_mib,
             })
@@ -975,12 +1162,12 @@ class InstallerWindow(Gtk.ApplicationWindow):
         confirm_btn = dialog.add_button("Confirm & Proceed", Gtk.ResponseType.OK)
         confirm_btn.get_style_context().add_class("suggested-action")
 
-        # ── State tracking ──
+        # ── State tracking (all sizes in MiB) ──
         plan_state = {
             "strategy": "shrink_root",
             "target_disk": root_disk_path,
             "shrink_dev": None,
-            "shrink_gb": 0,
+            "shrink_mib": 0,
         }
 
         # ── Update function ──
@@ -988,8 +1175,12 @@ class InstallerWindow(Gtk.ApplicationWindow):
             idx = disk_combo.get_active()
             if idx < 0 or idx >= len(disk_entries):
                 return
+            # Convert user's GB input to MiB for all internal use
             linux_gb = int(size_spin.get_value())
-            total_needed_gb = linux_gb + boot_gb
+            linux_mib = gb_to_mib(linux_gb)
+            total_needed_mib = linux_mib + boot_mib
+            total_needed_gb = mib_to_display_gb(total_needed_mib)
+
             sel = disk_entries[idx]
             sel_path = sel["path"]
             is_root_disk = sel["is_root"]
@@ -998,13 +1189,16 @@ class InstallerWindow(Gtk.ApplicationWindow):
             # Current layout
             layout_lines = get_disk_layout_text(sel_path)
             free_mib = get_disk_unallocated_mib(sel_path)
-            free_gb = round(free_mib / 1024, 1)
+            free_gb = mib_to_display_gb(free_mib)
             if free_gb > 0.01:
                 layout_lines.append("")
                 layout_lines.append(f"  Total unallocated space: {free_gb} GB")
             layout_text.get_buffer().set_text("\n".join(layout_lines))
 
-            has_free = (free_gb >= (boot_gb + 1))
+            has_free = (free_mib >= (boot_mib + gb_to_mib(1)))
+
+            boot_gb_display = mib_to_display_gb(boot_mib)
+            linux_gb_display = mib_to_display_gb(linux_mib)
 
             change_lines = []
             after_lines = []
@@ -1018,7 +1212,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
                 if has_free and can_shrink:
                     radio_primary.set_label(
                         f"Shrink root btrfs partition by {total_needed_gb} GB "
-                        f"for Linux ({linux_gb} GB) + boot ({boot_gb} GB)")
+                        f"for Linux ({linux_gb_display} GB) + boot ({boot_gb_display} GB)")
                     radio_primary.set_visible(True); radio_primary.set_sensitive(True)
                     radio_secondary.set_label(
                         f"Use existing unallocated space ({free_gb} GB) – no shrink needed")
@@ -1051,43 +1245,43 @@ class InstallerWindow(Gtk.ApplicationWindow):
                 if use_free:
                     plan_state["strategy"] = "use_free_root"
                     plan_state["shrink_dev"] = None
-                    plan_state["shrink_gb"] = 0
+                    plan_state["shrink_mib"] = 0
 
-                    root_size_gb = round(
-                        (get_partition_info(root_dev)[0] or 0) / 1e9, 2)
+                    root_total_bytes = get_partition_info(root_dev)[0] or 0
+                    root_size_gb = bytes_to_display_gb(root_total_bytes)
                     change_lines.append("  1. Root partition is NOT modified")
                     change_lines.append(
-                        f"  2. Create {boot_gb} GB FAT32 boot partition (LINUX_LIVE)")
+                        f"  2. Create {boot_gb_display} GB FAT32 boot partition (LINUX_LIVE)")
                     change_lines.append(
-                        f"  3. Remaining ~{round(free_gb - boot_gb, 1)} GB for Linux installation")
+                        f"  3. Remaining ~{mib_to_display_gb(free_mib - boot_mib)} GB for Linux installation")
                     change_lines.append(
                         f"  4. Configure UEFI/GRUB boot entry for {distro_label}")
 
                     for p_line in get_disk_layout_text(sel_path):
                         if "[Unallocated]" not in p_line:
                             after_lines.append(p_line.rstrip() + "  (unchanged)")
-                    remain_gb = round(free_gb - boot_gb, 1)
+                    remain_gb = mib_to_display_gb(free_mib - boot_mib)
                     if remain_gb > 0:
                         after_lines.append(
                             f"  [Unallocated – Linux]  {remain_gb} GB  ← for Linux installer")
                     after_lines.append(
-                        f"  LINUX_LIVE (FAT32)     {boot_gb} GB  ← {distro_label} live boot")
+                        f"  LINUX_LIVE (FAT32)     {boot_gb_display} GB  ← {distro_label} live boot")
                 else:
                     plan_state["strategy"] = "shrink_root"
                     plan_state["shrink_dev"] = root_dev
-                    plan_state["shrink_gb"] = total_needed_gb
+                    plan_state["shrink_mib"] = total_needed_mib
 
                     root_total, _ = get_partition_info(root_dev)
-                    root_size_gb = round((root_total or 0) / 1e9, 2)
+                    root_size_gb = bytes_to_display_gb(root_total or 0)
                     new_size_gb = round(root_size_gb - total_needed_gb, 2)
 
                     change_lines.append(
                         f"  1. Shrink root ({root_dev}) from "
                         f"{root_size_gb} GB to {new_size_gb} GB  (−{total_needed_gb} GB)")
                     change_lines.append(
-                        f"  2. Create {boot_gb} GB FAT32 boot partition (LINUX_LIVE)")
+                        f"  2. Create {boot_gb_display} GB FAT32 boot partition (LINUX_LIVE)")
                     change_lines.append(
-                        f"  3. Leave {linux_gb} GB unallocated for Linux installation")
+                        f"  3. Leave {linux_gb_display} GB unallocated for Linux installation")
                     change_lines.append(
                         f"  4. Configure UEFI/GRUB boot entry for {distro_label}")
 
@@ -1097,14 +1291,14 @@ class InstallerWindow(Gtk.ApplicationWindow):
                     for p in parts:
                         if p["is_free"]:
                             continue
-                        s_gb = round(p["size_mib"] / 1024, 2)
+                        s_gb = mib_to_display_gb(p["size_mib"])
                         if p["num"] == root_part_num:
                             after_lines.append(
                                 f"  Root ({root_dev})       {new_size_gb} GB  (shrunk)")
                             after_lines.append(
-                                f"  [Unallocated – Linux]  {linux_gb} GB  ← for Linux installer")
+                                f"  [Unallocated – Linux]  {linux_gb_display} GB  ← for Linux installer")
                             after_lines.append(
-                                f"  LINUX_LIVE (FAT32)     {boot_gb} GB  ← {distro_label} live boot")
+                                f"  LINUX_LIVE (FAT32)     {boot_gb_display} GB  ← {distro_label} live boot")
                         else:
                             dev_p = _part_dev_path(sel_path, p["num"])
                             lbl = p["name"] or get_partition_fstype(dev_p) or "Partition"
@@ -1113,7 +1307,6 @@ class InstallerWindow(Gtk.ApplicationWindow):
             else:
                 # ── Other disk ──
                 # Find shrinkable partitions on target disk
-                # btrfs can be shrunk live; ext4 can be shrunk if unmounted
                 SHRINKABLE_FS = ("btrfs", "ext4", "ext3", "ext2", "ntfs")
                 shrinkable = []
                 parts, _, _ = get_disk_partitions(sel_path)
@@ -1125,21 +1318,19 @@ class InstallerWindow(Gtk.ApplicationWindow):
                     if fs in SHRINKABLE_FS:
                         total_b, free_b = get_partition_usage(dev_p)
                         if not total_b or not free_b:
-                            # Partition might not be mounted — try fs-specific queries
                             if fs == "ntfs":
                                 total_b, free_b = _ntfs_info(dev_p)
                             if not total_b or not free_b:
-                                # Fallback: estimate from parted size (assume 50% free)
-                                part_size_b = p["size_mib"] * 1024 * 1024
+                                part_size_b = p["size_mib"] * MiB
                                 total_b = part_size_b
                                 free_b = part_size_b // 2
-                        if free_b > total_needed_gb * 1e9:
+                        if free_b > mib_to_bytes(total_needed_mib):
                             shrinkable.append({
                                 "dev": dev_p,
                                 "num": p["num"],
                                 "fstype": fs,
-                                "size_gb": round(p["size_mib"] / 1024, 2),
-                                "free_gb": round(free_b / 1e9, 2),
+                                "size_gb": mib_to_display_gb(p["size_mib"]),
+                                "free_gb": bytes_to_display_gb(free_b),
                             })
 
                 has_shrinkable = len(shrinkable) > 0
@@ -1153,7 +1344,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
                     fs = get_partition_fstype(dev_p)
                     if fs and fs not in SHRINKABLE_FS and fs not in ("vfat", "swap", ""):
                         non_shrinkable_fs.append({"dev": dev_p, "fstype": fs,
-                            "size_gb": round(p["size_mib"] / 1024, 2)})
+                            "size_gb": mib_to_display_gb(p["size_mib"])})
 
                 if has_free:
                     radio_primary.set_label(
@@ -1179,10 +1370,8 @@ class InstallerWindow(Gtk.ApplicationWindow):
                     radio_secondary.set_active(False)
 
                 # Always offer wipe & reformat for non-root disks if disk is large enough
-                # Wipe only needs space for ESP (0.5 GB) + boot partition; the rest
-                # is left unallocated for the Linux installer to use as it sees fit.
-                wipe_min_gb = 0.5 + boot_gb + 1  # ESP + boot + at least 1 GB remaining
-                disk_size_ok = (sel["size_gb"] >= wipe_min_gb)
+                wipe_min_mib = 512 + boot_mib + gb_to_mib(1)  # ESP + boot + at least 1 GB
+                disk_size_ok = (sel["size_mib"] >= wipe_min_mib)
                 radio_wipe.set_label(
                     f"⚠ Wipe & reformat entire disk ({sel['size_gb']} GB) – "
                     f"ALL DATA ON {sel['name']} WILL BE DESTROYED")
@@ -1214,10 +1403,10 @@ class InstallerWindow(Gtk.ApplicationWindow):
                 if using_wipe:
                     plan_state["strategy"] = "wipe_disk"
                     plan_state["shrink_dev"] = None
-                    plan_state["shrink_gb"] = 0
+                    plan_state["shrink_mib"] = 0
 
-                    esp_gb = 0.5
-                    usable_gb = round(sel["size_gb"] - esp_gb - boot_gb, 1)
+                    esp_mib = 512
+                    usable_gb = mib_to_display_gb(sel["size_mib"] - esp_mib - boot_mib)
 
                     change_lines.append("  ⚠ WARNING: This will ERASE ALL DATA on this disk!")
                     change_lines.append("")
@@ -1227,7 +1416,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
                     change_lines.append(
                         f"  3. Create 512 MB EFI System Partition (ESP)")
                     change_lines.append(
-                        f"  4. Create {boot_gb} GB FAT32 boot partition (LINUX_LIVE)")
+                        f"  4. Create {boot_gb_display} GB FAT32 boot partition (LINUX_LIVE)")
                     change_lines.append(
                         f"  5. Leave ~{usable_gb} GB unallocated for Linux installation")
                     change_lines.append(
@@ -1236,7 +1425,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
                     after_lines.append(
                         f"  EFI System (ESP)       0.5 GB  ← UEFI boot files")
                     after_lines.append(
-                        f"  LINUX_LIVE (FAT32)     {boot_gb} GB  ← {distro_label} live boot")
+                        f"  LINUX_LIVE (FAT32)     {boot_gb_display} GB  ← {distro_label} live boot")
                     after_lines.append(
                         f"  [Unallocated – Linux]  ~{usable_gb} GB  ← for Linux installer")
 
@@ -1244,7 +1433,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
                     best = max(shrinkable, key=lambda s: s["free_gb"])
                     plan_state["strategy"] = "other_disk_shrink"
                     plan_state["shrink_dev"] = best["dev"]
-                    plan_state["shrink_gb"] = total_needed_gb
+                    plan_state["shrink_mib"] = total_needed_mib
 
                     new_size_gb = round(best["size_gb"] - total_needed_gb, 2)
                     change_lines.append("  1. Root partition is NOT modified (different disk)")
@@ -1252,24 +1441,24 @@ class InstallerWindow(Gtk.ApplicationWindow):
                         f"  2. Shrink {best['dev']} from {best['size_gb']} GB to "
                         f"{new_size_gb} GB  (−{total_needed_gb} GB)")
                     change_lines.append(
-                        f"  3. Create {boot_gb} GB FAT32 boot partition (LINUX_LIVE)")
+                        f"  3. Create {boot_gb_display} GB FAT32 boot partition (LINUX_LIVE)")
                     change_lines.append(
-                        f"  4. Leave {linux_gb} GB unallocated for Linux installation")
+                        f"  4. Leave {linux_gb_display} GB unallocated for Linux installation")
                     change_lines.append(
                         f"  5. Configure UEFI/GRUB boot entry for {distro_label}")
 
                     for p in parts:
                         if p["is_free"]:
                             continue
-                        s_gb = round(p["size_mib"] / 1024, 2)
+                        s_gb = mib_to_display_gb(p["size_mib"])
                         dev_p = _part_dev_path(sel_path, p["num"])
                         if dev_p == best["dev"]:
                             after_lines.append(
                                 f"  {dev_p:<22} {new_size_gb} GB  (shrunk)")
                             after_lines.append(
-                                f"  [Unallocated – Linux]  {linux_gb} GB  ← for Linux installer")
+                                f"  [Unallocated – Linux]  {linux_gb_display} GB  ← for Linux installer")
                             after_lines.append(
-                                f"  LINUX_LIVE (FAT32)     {boot_gb} GB  ← {distro_label} live boot")
+                                f"  LINUX_LIVE (FAT32)     {boot_gb_display} GB  ← {distro_label} live boot")
                         else:
                             lbl = p["name"] or get_partition_fstype(dev_p) or "Partition"
                             after_lines.append(f"  {lbl:<22} {s_gb} GB")
@@ -1277,11 +1466,11 @@ class InstallerWindow(Gtk.ApplicationWindow):
                 elif has_free:
                     plan_state["strategy"] = "other_disk_free"
                     plan_state["shrink_dev"] = None
-                    plan_state["shrink_gb"] = 0
+                    plan_state["shrink_mib"] = 0
 
                     change_lines.append("  1. Root partition is NOT modified (different disk)")
                     change_lines.append(
-                        f"  2. Create {boot_gb} GB FAT32 boot partition (LINUX_LIVE) "
+                        f"  2. Create {boot_gb_display} GB FAT32 boot partition (LINUX_LIVE) "
                         f"on {sel['name']}")
                     change_lines.append(
                         f"  3. Remaining unallocated space for Linux installation")
@@ -1291,16 +1480,16 @@ class InstallerWindow(Gtk.ApplicationWindow):
                     for p in parts:
                         if p["is_free"]:
                             continue
-                        s_gb = round(p["size_mib"] / 1024, 2)
+                        s_gb = mib_to_display_gb(p["size_mib"])
                         dev_p = _part_dev_path(sel_path, p["num"])
                         lbl = p["name"] or get_partition_fstype(dev_p) or "Partition"
                         after_lines.append(f"  {lbl:<22} {s_gb} GB  (unchanged)")
-                    remain_gb = round(free_gb - boot_gb, 1)
+                    remain_gb = mib_to_display_gb(free_mib - boot_mib)
                     if remain_gb > 0:
                         after_lines.append(
                             f"  [Unallocated – Linux]  {remain_gb} GB  ← for Linux installer")
                     after_lines.append(
-                        f"  LINUX_LIVE (FAT32)     {boot_gb} GB  ← {distro_label} live boot")
+                        f"  LINUX_LIVE (FAT32)     {boot_gb_display} GB  ← {distro_label} live boot")
                 else:
                     plan_state["strategy"] = "blocked"
                     change_lines.append("  Cannot proceed with this disk.")
@@ -1322,7 +1511,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
                     for p in parts:
                         if p["is_free"]:
                             continue
-                        s_gb = round(p["size_mib"] / 1024, 2)
+                        s_gb = mib_to_display_gb(p["size_mib"])
                         dev_p = _part_dev_path(sel_path, p["num"])
                         lbl = p["name"] or get_partition_fstype(dev_p) or "Partition"
                         after_lines.append(f"  {lbl:<22} {s_gb} GB  (unchanged)")
@@ -1351,13 +1540,14 @@ class InstallerWindow(Gtk.ApplicationWindow):
         dialog.destroy()
 
         if response == Gtk.ResponseType.OK:
+            linux_mib = gb_to_mib(int(size_spin.get_value()))
             return {
                 "approved": True,
                 "strategy": plan_state["strategy"],
                 "target_disk": plan_state["target_disk"],
                 "shrink_dev": plan_state["shrink_dev"],
-                "shrink_gb": plan_state["shrink_gb"],
-                "linux_gb": int(size_spin.get_value()),
+                "shrink_mib": plan_state["shrink_mib"],
+                "linux_mib": linux_mib,
             }
         return None
 
@@ -1401,12 +1591,6 @@ class InstallerWindow(Gtk.ApplicationWindow):
         self.log("Linux Live Installer starting")
         self.log("=" * 52)
 
-        # ── 0. root check ──────────────────────────────────────────────────
-        if os.geteuid() != 0:
-            self.log("ERROR: installer must be run as root (sudo).", error=True)
-            self.log("Re-launch with:  sudo python3 linux_installer.py", error=True)
-            self.set_status("Please restart as root (sudo).")
-            return
 
         # ── 1. gather info ─────────────────────────────────────────────────
         self.fs_info = get_root_fs_info()
@@ -1450,10 +1634,10 @@ class InstallerWindow(Gtk.ApplicationWindow):
         strategy = plan["strategy"]
         target_disk = plan["target_disk"]
         shrink_dev = plan.get("shrink_dev")
-        shrink_gb = plan.get("shrink_gb", 0)
-        linux_gb = plan.get("linux_gb", 30)
+        shrink_mib = plan.get("shrink_mib", 0)
+        linux_mib = plan.get("linux_mib", gb_to_mib(30))
         self.log(f"Disk plan approved. Strategy: {strategy}, Target: {target_disk}")
-        self.log(f"Target size : {linux_gb} GB")
+        self.log(f"Target size : {mib_to_display_gb(linux_mib)} GB ({linux_mib} MiB)")
 
         # ── 2. resolve ISO ─────────────────────────────────────────────────
         if custom_mode:
@@ -1466,7 +1650,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
             iso_path = str(iso_cache_dir() / distro["filename"])
             if os.path.exists(iso_path):
                 sz = os.path.getsize(iso_path)
-                self.log(f"Found cached ISO ({bytes_to_gb(sz)} GB): {iso_path}")
+                self.log(f"Found cached ISO ({bytes_to_display_gb(sz)} GB): {iso_path}")
                 ok = self._verify_checksum(iso_path, distro["sha256"])
                 if not ok:
                     self.log("Checksum mismatch – deleting and re-downloading.", error=True)
@@ -1490,31 +1674,26 @@ class InstallerWindow(Gtk.ApplicationWindow):
             warn_event.wait()
 
         if strategy == "shrink_root":
-            # Shrink root btrfs and create partitions on the same disk
             if fstype != "btrfs":
                 self.log(f"Cannot shrink root: filesystem is {fstype}, not btrfs.", error=True)
                 return
-            ok = self._strategy_btrfs(device, linux_gb, iso_path, distro,
+            ok = self._strategy_btrfs(device, linux_mib, iso_path, distro,
                                        distro_key, custom_mode)
         elif strategy == "use_free_root":
-            # Use existing unallocated space on root disk
-            ok = self._strategy_use_free(target_disk, linux_gb, iso_path,
+            ok = self._strategy_use_free(target_disk, linux_mib, iso_path,
                                           distro, distro_key, custom_mode)
         elif strategy == "other_disk_shrink":
-            # Shrink a btrfs partition on another disk
             if not shrink_dev:
                 self.log("No partition selected to shrink.", error=True)
                 return
             ok = self._strategy_other_disk_shrink(
-                target_disk, shrink_dev, shrink_gb, linux_gb,
+                target_disk, shrink_dev, shrink_mib, linux_mib,
                 iso_path, distro, distro_key, custom_mode)
         elif strategy == "other_disk_free":
-            # Use existing free space on another disk
-            ok = self._strategy_use_free(target_disk, linux_gb, iso_path,
+            ok = self._strategy_use_free(target_disk, linux_mib, iso_path,
                                           distro, distro_key, custom_mode)
         elif strategy == "wipe_disk":
-            # Wipe and reformat entire secondary disk
-            ok = self._strategy_wipe_disk(target_disk, linux_gb, iso_path,
+            ok = self._strategy_wipe_disk(target_disk, linux_mib, iso_path,
                                            distro, distro_key, custom_mode)
         else:
             self.log(f"Unknown strategy: {strategy}", error=True)
@@ -1536,7 +1715,6 @@ class InstallerWindow(Gtk.ApplicationWindow):
         self._update_grub()
         if self._boot_part_dev:
             if custom_mode and self.custom_iso_path:
-                # Derive a label from the custom ISO filename
                 iso_basename = os.path.basename(self.custom_iso_path)
                 custom_label = os.path.splitext(iso_basename)[0]
                 self._set_uefi_boot_entry(self._boot_part_dev, custom_label)
@@ -1575,7 +1753,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
                                 GLib.idle_add(self.progress.set_fraction, frac)
                                 self.set_status(
                                     f"Downloading {frac*100:.0f}%  {mb} / {total_mb} MB")
-                self.log(f"Download complete: {bytes_to_gb(os.path.getsize(dest))} GB")
+                self.log(f"Download complete: {bytes_to_display_gb(os.path.getsize(dest))} GB")
                 GLib.idle_add(self.progress.set_fraction, 0)
 
                 # verify
@@ -1623,23 +1801,21 @@ class InstallerWindow(Gtk.ApplicationWindow):
         self.set_status("Shrinking partition…")
 
         sfdisk_script = f"{part_num}: size={new_size_sectors}\n"
-        result = subprocess.run(
+        rc, _, sfdisk_err = run(
             ["sfdisk", "--no-reread", "-N", str(part_num), disk_dev],
-            input=sfdisk_script, capture_output=True, text=True,
+            input=sfdisk_script,
         )
-        if result.returncode != 0:
-            self.log(f"sfdisk resize failed: {result.stderr.strip()}", error=True)
+        if rc != 0:
+            self.log(f"sfdisk resize failed: {sfdisk_err}", error=True)
             self.log("Trying parted fallback…")
-            env = os.environ.copy()
-            env["LANG"] = "C"
-            env["LC_ALL"] = "C"
-            result2 = subprocess.run(
-                ["parted", "---pretend-input-tty", "-s", "--", disk_dev,
+            rc2, _, parted_err = run(
+                ["env", "LANG=C", "LC_ALL=C",
+                 "parted", "---pretend-input-tty", "-s", "--", disk_dev,
                  "resizepart", str(part_num), f"{new_part_end_mib}MiB"],
-                input="Yes\n", capture_output=True, text=True, env=env,
+                input="Yes\n",
             )
-            if result2.returncode != 0:
-                self.log(f"Partition resize failed: {result2.stderr.strip()}", error=True)
+            if rc2 != 0:
+                self.log(f"Partition resize failed: {parted_err}", error=True)
                 return None
 
         run(["partprobe", disk_dev])
@@ -1731,7 +1907,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
             return False
 
         mnt = "/mnt/linux_installer_boot"
-        os.makedirs(mnt, exist_ok=True)
+        priv_makedirs(mnt)
         run(["mount", boot_dev, mnt])
         try:
             ok = self._copy_iso_to_mount(iso_path, mnt, distro, distro_key)
@@ -1749,12 +1925,16 @@ class InstallerWindow(Gtk.ApplicationWindow):
             boot_dev=boot_dev, linux_dev=linux_dev, distro_label=distro_label)
 
     # ── btrfs strategy ────────────────────────────────────────────────────────
-    def _strategy_btrfs(self, device, linux_gb, iso_path, distro, distro_key, custom_mode):
-        """Shrink root btrfs, resize partition entry, create boot+linux partitions."""
+    def _strategy_btrfs(self, device, linux_mib, iso_path, distro, distro_key, custom_mode):
+        """Shrink root btrfs, resize partition entry, create boot+linux partitions.
+        
+        All arithmetic is in MiB. The btrfs resize target is derived from the
+        same MiB value used for the partition table, ensuring exact agreement."""
         self.log("")
         self.log("━━ Strategy: btrfs shrink + new partition ━━")
 
-        total_shrink_gb = linux_gb + MIN_BOOT_GB
+        boot_mib = gb_to_mib(MIN_BOOT_GB)
+        total_shrink_mib = linux_mib + boot_mib
 
         # ── get btrfs usage ──
         self.set_status("Querying btrfs filesystem usage…")
@@ -1772,22 +1952,27 @@ class InstallerWindow(Gtk.ApplicationWindow):
                 used = int(stripped.split(":")[1].strip().split()[0])
 
         free_bytes = dev_size - used
-        needed_bytes = total_shrink_gb * GiB
+        needed_bytes = mib_to_bytes(total_shrink_mib)
         safe_free = free_bytes - (10 * GiB)
 
-        self.log(f"btrfs device size : {bytes_to_gb(dev_size)} GB")
-        self.log(f"btrfs used        : {bytes_to_gb(used)} GB")
-        self.log(f"Available to shrink: {bytes_to_gb(safe_free)} GB")
+        self.log(f"btrfs device size : {bytes_to_display_gb(dev_size)} GB")
+        self.log(f"btrfs used        : {bytes_to_display_gb(used)} GB")
+        self.log(f"Available to shrink: {bytes_to_display_gb(safe_free)} GB")
 
         if safe_free < needed_bytes:
             self.log(
-                f"Not enough space! Need {total_shrink_gb} GB, "
-                f"have only {bytes_to_gb(safe_free)} GB safe to use.", error=True)
+                f"Not enough space! Need {mib_to_display_gb(total_shrink_mib)} GB, "
+                f"have only {bytes_to_display_gb(safe_free)} GB safe to use.", error=True)
             return False
 
-        new_fs_size_bytes = dev_size - needed_bytes
-        self.log(f"Shrinking btrfs from {bytes_to_gb(dev_size)} GB "
-                 f"to {bytes_to_gb(new_fs_size_bytes)} GB…")
+        # Compute new filesystem size in MiB, then derive exact byte target.
+        # This ensures the btrfs filesystem and partition table entry use
+        # the same MiB-aligned boundary.
+        new_fs_size_mib = bytes_to_mib(dev_size) - total_shrink_mib
+        new_fs_size_bytes = mib_to_bytes(new_fs_size_mib)
+
+        self.log(f"Shrinking btrfs to {mib_to_display_gb(new_fs_size_mib)} GB "
+                 f"({new_fs_size_mib} MiB, {new_fs_size_bytes} bytes)…")
         self.set_status("Shrinking btrfs filesystem (this may take a while)…")
 
         code, out, err = run(["btrfs", "filesystem", "resize",
@@ -1808,16 +1993,17 @@ class InstallerWindow(Gtk.ApplicationWindow):
                 if stripped.startswith("Device size:"):
                     actual_size = int(stripped.split(":")[1].strip().split()[0])
             if actual_size > 0:
-                tolerance = 100 << 20  # 100 MiB
+                tolerance = 100 * MiB
                 if actual_size > new_fs_size_bytes + tolerance:
                     self.log(
                         f"Post-shrink check failed: btrfs still reports "
-                        f"{bytes_to_gb(actual_size)} GB, expected "
-                        f"{bytes_to_gb(new_fs_size_bytes)} GB. "
+                        f"{bytes_to_display_gb(actual_size)} GB, expected "
+                        f"{bytes_to_display_gb(new_fs_size_bytes)} GB. "
                         f"Aborting to avoid partition table corruption.", error=True)
                     return False
-                self.log(f"Post-shrink verified: btrfs is now {bytes_to_gb(actual_size)} GB "
-                         f"(target {bytes_to_gb(new_fs_size_bytes)} GB).")
+                self.log(f"Post-shrink verified: btrfs is now "
+                         f"{bytes_to_display_gb(actual_size)} GB "
+                         f"(target {bytes_to_display_gb(new_fs_size_bytes)} GB).")
 
         # ── find parent disk and partition, get layout ──
         disk_dev, part_num = self._resolve_disk_and_part(device)
@@ -1844,9 +2030,18 @@ class InstallerWindow(Gtk.ApplicationWindow):
             self.log("Cannot determine partition boundaries.", error=True)
             return False
 
-        new_part_size_mib = part_end_mib - part_start_mib - total_shrink_gb * 1024
+        # The new partition size must be >= the btrfs filesystem size.
+        # We use the same MiB value to guarantee this.
+        new_part_size_mib = new_fs_size_mib
         if new_part_size_mib < 1:
             self.log("Calculated new partition size is too small!", error=True)
+            return False
+
+        # Safety: ensure new partition is not larger than current
+        current_part_size_mib = part_end_mib - part_start_mib
+        if new_part_size_mib > current_part_size_mib:
+            self.log(f"New partition size ({new_part_size_mib} MiB) would exceed "
+                     f"current ({current_part_size_mib} MiB). Aborting.", error=True)
             return False
 
         # ── shrink the partition table entry ──
@@ -1859,7 +2054,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
 
         # ── create boot + linux partitions in freed space ──
         boot_start = actual_new_end + 1
-        boot_end = boot_start + MIN_BOOT_GB * 1024
+        boot_end = boot_start + boot_mib
         linux_start = boot_end + 1
         if next_part_start_mib is not None:
             linux_end_str = f"{next_part_start_mib - 1}MiB"
@@ -1881,13 +2076,14 @@ class InstallerWindow(Gtk.ApplicationWindow):
         return True
 
     # ── use-free-space strategy (root or other disk) ─────────────────────────
-    def _strategy_use_free(self, disk_path, linux_gb, iso_path, distro,
+    def _strategy_use_free(self, disk_path, linux_mib, iso_path, distro,
                            distro_key, custom_mode):
         """Create partitions in existing unallocated space on disk_path."""
         self.log("")
         self.log("━━ Strategy: use existing unallocated space ━━")
 
-        total_needed_gb = linux_gb + MIN_BOOT_GB
+        boot_mib = gb_to_mib(MIN_BOOT_GB)
+        total_needed_mib = linux_mib + boot_mib
 
         parts, disk_label, _ = get_disk_partitions(disk_path)
         is_gpt = "gpt" in disk_label.lower()
@@ -1895,7 +2091,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
         # Find largest free region that fits
         best_free = None
         for p in parts:
-            if p["is_free"] and p["size_mib"] >= total_needed_gb * 1024:
+            if p["is_free"] and p["size_mib"] >= total_needed_mib:
                 if best_free is None or p["size_mib"] > best_free["size_mib"]:
                     best_free = p
 
@@ -1904,10 +2100,10 @@ class InstallerWindow(Gtk.ApplicationWindow):
             return False
 
         self.log(f"Using free region: {best_free['start_mib']}–{best_free['end_mib']} MiB "
-                 f"({round(best_free['size_mib'] / 1024, 1)} GB)")
+                 f"({mib_to_display_gb(best_free['size_mib'])} GB)")
 
         boot_start = best_free["start_mib"] + 1
-        boot_end = boot_start + MIN_BOOT_GB * 1024
+        boot_end = boot_start + boot_mib
         linux_start = boot_end + 1
         linux_end_str = f"{best_free['end_mib'] - 1}MiB"
 
@@ -1924,12 +2120,12 @@ class InstallerWindow(Gtk.ApplicationWindow):
         return True
 
     # ── filesystem shrink helpers ───────────────────────────────────────────
-    def _shrink_btrfs(self, dev, shrink_bytes):
-        """Shrink a btrfs filesystem by shrink_bytes. Can be done live (mounted)."""
+    def _shrink_btrfs(self, dev, shrink_mib):
+        """Shrink a btrfs filesystem by shrink_mib MiB. Can be done live (mounted)."""
         code, mnt_out, _ = run(["findmnt", "-n", "-o", "TARGET", dev])
         if code != 0 or not mnt_out.strip():
             tmp_mnt = "/mnt/linux_installer_shrink_target"
-            os.makedirs(tmp_mnt, exist_ok=True)
+            priv_makedirs(tmp_mnt)
             code, _, err = run(["mount", dev, tmp_mnt])
             if code != 0:
                 self.log(f"Cannot mount {dev}: {err}", error=True)
@@ -1953,12 +2149,15 @@ class InstallerWindow(Gtk.ApplicationWindow):
                 if stripped.startswith("Device size:"):
                     dev_size = int(stripped.split(":")[1].strip().split()[0])
 
-            new_fs_size = dev_size - shrink_bytes
-            self.log(f"Shrinking btrfs from {bytes_to_gb(dev_size)} GB "
-                     f"to {bytes_to_gb(new_fs_size)} GB")
+            # Compute new size in MiB, then derive exact bytes
+            new_fs_mib = bytes_to_mib(dev_size) - shrink_mib
+            new_fs_bytes = mib_to_bytes(new_fs_mib)
+
+            self.log(f"Shrinking btrfs from {bytes_to_display_gb(dev_size)} GB "
+                     f"to {mib_to_display_gb(new_fs_mib)} GB ({new_fs_mib} MiB)")
             self.set_status(f"Shrinking btrfs on {dev}…")
             code, _, err = run(["btrfs", "filesystem", "resize",
-                                 str(new_fs_size), mountpoint])
+                                 str(new_fs_bytes), mountpoint])
             if code != 0:
                 self.log(f"btrfs resize failed: {err}", error=True)
                 return False
@@ -1973,21 +2172,22 @@ class InstallerWindow(Gtk.ApplicationWindow):
                     if stripped.startswith("Device size:"):
                         actual_size = int(stripped.split(":")[1].strip().split()[0])
                 if actual_size > 0:
-                    tolerance = 100 << 20  # 100 MiB
-                    if actual_size > new_fs_size + tolerance:
+                    tolerance = 100 * MiB
+                    if actual_size > new_fs_bytes + tolerance:
                         self.log(
                             f"Post-shrink check failed: btrfs still reports "
-                            f"{bytes_to_gb(actual_size)} GB, expected "
-                            f"{bytes_to_gb(new_fs_size)} GB.", error=True)
+                            f"{bytes_to_display_gb(actual_size)} GB, expected "
+                            f"{mib_to_display_gb(new_fs_mib)} GB.", error=True)
                         return False
-                    self.log(f"Post-shrink verified: btrfs is now {bytes_to_gb(actual_size)} GB.")
+                    self.log(f"Post-shrink verified: btrfs is now "
+                             f"{bytes_to_display_gb(actual_size)} GB.")
             return True
         finally:
             if not was_mounted:
                 run(["umount", mountpoint])
 
-    def _shrink_ext(self, dev, shrink_bytes):
-        """Shrink an ext2/3/4 filesystem by shrink_bytes. Must be unmounted first."""
+    def _shrink_ext(self, dev, shrink_mib):
+        """Shrink an ext2/3/4 filesystem by shrink_mib MiB. Must be unmounted first."""
         # Check if currently mounted
         code, mnt_out, _ = run(["findmnt", "-n", "-o", "TARGET", dev])
         if code == 0 and mnt_out.strip():
@@ -2020,11 +2220,12 @@ class InstallerWindow(Gtk.ApplicationWindow):
             return False
 
         current_size = block_size * block_count
+        shrink_bytes = mib_to_bytes(shrink_mib)
         new_size = current_size - shrink_bytes
         new_blocks = new_size // block_size
 
-        self.log(f"ext filesystem: {bytes_to_gb(current_size)} GB → "
-                 f"{bytes_to_gb(new_size)} GB ({new_blocks} blocks)")
+        self.log(f"ext filesystem: {bytes_to_display_gb(current_size)} GB → "
+                 f"{bytes_to_display_gb(new_size)} GB ({new_blocks} blocks)")
 
         # Resize
         self.set_status(f"Shrinking ext filesystem on {dev}…")
@@ -2048,19 +2249,20 @@ class InstallerWindow(Gtk.ApplicationWindow):
                     actual_block_count = int(line.split(":")[1].strip())
             if actual_block_size > 0 and actual_block_count > 0:
                 actual_size = actual_block_size * actual_block_count
-                tolerance = 100 << 20  # 100 MiB
+                tolerance = 100 * MiB
                 if actual_size > new_size + tolerance:
                     self.log(
                         f"Post-shrink check failed: ext reports "
-                        f"{bytes_to_gb(actual_size)} GB, expected "
-                        f"{bytes_to_gb(new_size)} GB.", error=True)
+                        f"{bytes_to_display_gb(actual_size)} GB, expected "
+                        f"{bytes_to_display_gb(new_size)} GB.", error=True)
                     return False
-                self.log(f"Post-shrink verified: ext is now {bytes_to_gb(actual_size)} GB "
-                         f"(target {bytes_to_gb(new_size)} GB).")
+                self.log(f"Post-shrink verified: ext is now "
+                         f"{bytes_to_display_gb(actual_size)} GB "
+                         f"(target {bytes_to_display_gb(new_size)} GB).")
         return True
 
-    def _shrink_ntfs(self, dev, shrink_bytes):
-        """Shrink an NTFS filesystem by shrink_bytes using ntfsresize. Must be unmounted."""
+    def _shrink_ntfs(self, dev, shrink_mib):
+        """Shrink an NTFS filesystem by shrink_mib MiB using ntfsresize. Must be unmounted."""
         # Check if currently mounted
         code, mnt_out, _ = run(["findmnt", "-n", "-o", "TARGET", dev])
         if code == 0 and mnt_out.strip():
@@ -2094,13 +2296,15 @@ class InstallerWindow(Gtk.ApplicationWindow):
             self.log("Cannot determine current NTFS volume size.", error=True)
             return False
 
+        shrink_bytes = mib_to_bytes(shrink_mib)
         new_size = current_size - shrink_bytes
-        if new_size < GiB:  # 1 GB minimum
-            self.log(f"New NTFS size would be too small: {bytes_to_gb(new_size)} GB",
-                     error=True)
+        if new_size < GiB:  # 1 GiB minimum
+            self.log(f"New NTFS size would be too small: "
+                     f"{bytes_to_display_gb(new_size)} GB", error=True)
             return False
 
-        self.log(f"NTFS: {bytes_to_gb(current_size)} GB → {bytes_to_gb(new_size)} GB")
+        self.log(f"NTFS: {bytes_to_display_gb(current_size)} GB → "
+                 f"{bytes_to_display_gb(new_size)} GB")
 
         # Do a dry run first
         self.set_status(f"Testing NTFS resize on {dev}…")
@@ -2131,26 +2335,31 @@ class InstallerWindow(Gtk.ApplicationWindow):
                     actual_size = _parse_bytes_value(line)
                     break
             if actual_size > 0:
-                tolerance = 100 << 20  # 100 MiB
+                tolerance = 100 * MiB
                 if actual_size > new_size + tolerance:
                     self.log(
                         f"Post-shrink check failed: NTFS still reports "
-                        f"{bytes_to_gb(actual_size)} GB, expected "
-                        f"{bytes_to_gb(new_size)} GB.", error=True)
+                        f"{bytes_to_display_gb(actual_size)} GB, expected "
+                        f"{bytes_to_display_gb(new_size)} GB.", error=True)
                     return False
-                self.log(f"Post-shrink verified: NTFS is now {bytes_to_gb(actual_size)} GB "
-                         f"(target {bytes_to_gb(new_size)} GB).")
+                self.log(f"Post-shrink verified: NTFS is now "
+                         f"{bytes_to_display_gb(actual_size)} GB "
+                         f"(target {bytes_to_display_gb(new_size)} GB).")
         return True
 
     # ── other-disk-shrink strategy ───────────────────────────────────────────
-    def _strategy_other_disk_shrink(self, disk_path, shrink_dev, shrink_gb,
-                                     linux_gb, iso_path, distro, distro_key,
+    def _strategy_other_disk_shrink(self, disk_path, shrink_dev, shrink_mib,
+                                     linux_mib, iso_path, distro, distro_key,
                                      custom_mode):
         """Shrink a partition on another disk and create boot+linux partitions."""
         self.log("")
         self.log("━━ Strategy: shrink partition on another disk ━━")
         self.log(f"Target disk: {disk_path}")
-        self.log(f"Shrinking: {shrink_dev} by {shrink_gb} GB")
+        self.log(f"Shrinking: {shrink_dev} by {mib_to_display_gb(shrink_mib)} GB "
+                 f"({shrink_mib} MiB)")
+
+        boot_mib = gb_to_mib(MIN_BOOT_GB)
+        total_needed_mib = linux_mib + boot_mib
 
         # Verify and dispatch filesystem shrink
         fstype = get_partition_fstype(shrink_dev)
@@ -2159,10 +2368,9 @@ class InstallerWindow(Gtk.ApplicationWindow):
                      f"only btrfs, ext4, and NTFS are supported.", error=True)
             return False
 
-        needed_bytes = shrink_gb * GiB
         shrink_fn = {"btrfs": self._shrink_btrfs, "ntfs": self._shrink_ntfs}.get(
             fstype, self._shrink_ext)
-        if not shrink_fn(shrink_dev, needed_bytes):
+        if not shrink_fn(shrink_dev, shrink_mib):
             return False
 
         # Get partition layout and find the shrunk partition
@@ -2189,7 +2397,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
             self.log("Cannot determine partition boundaries.", error=True)
             return False
 
-        new_part_size_mib = part_end_mib - part_start_mib - shrink_gb * 1024
+        new_part_size_mib = part_end_mib - part_start_mib - total_needed_mib
 
         actual_new_end = self._resize_partition_entry(
             disk_path, part_num, part_start_mib, new_part_size_mib)
@@ -2198,7 +2406,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
 
         # Create boot + linux partitions in freed space
         boot_start = actual_new_end + 1
-        boot_end = boot_start + MIN_BOOT_GB * 1024
+        boot_end = boot_start + boot_mib
         linux_start = boot_end + 1
         linux_end_str = f"{next_part_start_mib - 1}MiB" if next_part_start_mib else "100%"
 
@@ -2215,7 +2423,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
         return True
 
     # ── wipe-disk strategy (secondary drives only) ─────────────────────────
-    def _strategy_wipe_disk(self, disk_path, linux_gb, iso_path, distro,
+    def _strategy_wipe_disk(self, disk_path, linux_mib, iso_path, distro,
                             distro_key, custom_mode):
         """Wipe the entire secondary disk, create GPT, ESP, boot partition,
         and leave remaining space for the Linux installer."""
@@ -2223,7 +2431,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
         self.log("━━ Strategy: wipe & reformat entire disk ━━")
         self.log(f"Target disk: {disk_path}")
 
-        boot_gb = MIN_BOOT_GB
+        boot_mib = gb_to_mib(MIN_BOOT_GB)
         esp_mib = 512  # 512 MiB EFI System Partition
 
         # Safety: make sure this is NOT the root disk
@@ -2284,28 +2492,24 @@ class InstallerWindow(Gtk.ApplicationWindow):
         time.sleep(1)
 
         # ── Inhibit automounting BEFORE touching disk ──────────────────
-        # Desktop environments (via udisks2) race to probe and mount new
-        # partitions, which blocks mkfs with "Device or resource busy".
-        # We must install inhibitors BEFORE creating any partitions.
         udev_rule_path = "/run/udev/rules.d/99-ulli-inhibit.rules"
         disk_basename = os.path.basename(disk_path)
         udev_rule_installed = False
         udisks_was_running = False
 
         try:
-            os.makedirs("/run/udev/rules.d", exist_ok=True)
-            with open(udev_rule_path, "w") as f:
-                f.write(
-                    f'SUBSYSTEM=="block", KERNEL=="{disk_basename}*", '
-                    f'ENV{{UDISKS_IGNORE}}="1", ENV{{UDISKS_AUTO}}="0"\n')
+            priv_makedirs("/run/udev/rules.d")
+            udev_content = (
+                f'SUBSYSTEM=="block", KERNEL=="{disk_basename}*", '
+                f'ENV{{UDISKS_IGNORE}}="1", ENV{{UDISKS_AUTO}}="0"\n')
+            priv_write_file(udev_rule_path, udev_content)
             run(["udevadm", "control", "--reload-rules"])
             udev_rule_installed = True
             self.log("Automount inhibit udev rule installed.")
         except Exception as e:
             self.log(f"Note: could not set udev inhibit rule: {e}")
 
-        # Stop udisks2 temporarily — this is the most reliable way to
-        # prevent automounting since udev rules alone don't always work
+        # Stop udisks2 temporarily
         if shutil.which("systemctl"):
             code, _, _ = run(["systemctl", "is-active", "--quiet", "udisks2"])
             if code == 0:
@@ -2314,8 +2518,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
                 udisks_was_running = True
 
         try:
-            # Wipe filesystem signatures so the kernel/parted don't consider
-            # partitions "in use" based on residual superblocks
+            # Wipe filesystem signatures
             if shutil.which("wipefs"):
                 self.log(f"Wiping filesystem signatures on {disk_path}…")
                 run(["wipefs", "--all", "--force", disk_path])
@@ -2334,14 +2537,12 @@ class InstallerWindow(Gtk.ApplicationWindow):
             code, _, err = run(["parted", "-s", disk_path, "mklabel", "gpt"])
             if code != 0:
                 self.log(f"parted mklabel failed: {err}", error=True)
-                # Fallback: use sgdisk --zap-all which is more forceful
                 if shutil.which("sgdisk"):
                     self.log("Trying sgdisk fallback…")
                     code2, _, err2 = run(["sgdisk", "--zap-all", disk_path])
                     if code2 != 0:
                         self.log(f"sgdisk --zap-all also failed: {err2}", error=True)
                         return False
-                    # sgdisk --zap-all leaves a blank disk; now create GPT
                     code3, _, err3 = run(["sgdisk", "-o", disk_path])
                     if code3 != 0:
                         self.log(f"sgdisk -o failed: {err3}", error=True)
@@ -2356,13 +2557,13 @@ class InstallerWindow(Gtk.ApplicationWindow):
             time.sleep(1)
 
             # Partition layout:
-            #   1. ESP:        1 MiB – 513 MiB  (512 MiB, FAT32, esp flag)
-            #   2. LINUX_LIVE: 513 MiB – (513 + boot_gb*1024) MiB  (FAT32, live ISO)
+            #   1. ESP:        1 MiB – (1 + esp_mib) MiB  (512 MiB, FAT32, esp flag)
+            #   2. LINUX_LIVE: next – (next + boot_mib) MiB  (FAT32, live ISO)
             #   3. Remaining:  unallocated for the Linux installer
             esp_start = 1        # MiB (1 MiB alignment)
             esp_end = esp_start + esp_mib
             boot_start = esp_end
-            boot_end = boot_start + boot_gb * 1024
+            boot_end = boot_start + boot_mib
 
             self.log(f"Creating ESP partition: {esp_start}–{esp_end} MiB")
             self.log(f"Creating boot partition: {boot_start}–{boot_end} MiB")
@@ -2415,10 +2616,8 @@ class InstallerWindow(Gtk.ApplicationWindow):
                     run(["udisksctl", "unmount", "-b", dev, "--no-user-interaction"])
                 if shutil.which("wipefs"):
                     run(["wipefs", "--all", "--force", dev])
-                # Kill any process using the device
                 if shutil.which("fuser"):
                     run(["fuser", "-k", dev])
-                # Check for device-mapper holders on this partition
                 dev_name = os.path.basename(dev)
                 holders_dir = f"/sys/class/block/{dev_name}/holders"
                 if os.path.isdir(holders_dir):
@@ -2428,8 +2627,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
 
             time.sleep(1)
 
-            # Wipe the first few MB of each new partition to clear any residual
-            # signatures and release kernel probe locks before formatting
+            # Wipe first few MB of each new partition
             for dev in (esp_dev, boot_dev):
                 run(["dd", "if=/dev/zero", f"of={dev}",
                      "bs=1M", "count=2", "conv=notrunc", "status=none"])
@@ -2466,7 +2664,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
             # Always remove the udev inhibit rule and restart udisks2
             if udev_rule_installed:
                 try:
-                    os.unlink(udev_rule_path)
+                    priv_unlink(udev_rule_path)
                     run(["udevadm", "control", "--reload-rules"])
                     self.log("Automount inhibit rule removed.")
                 except Exception:
@@ -2477,7 +2675,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
 
         # Mount and copy ISO to boot partition
         mnt = "/mnt/linux_installer_boot"
-        os.makedirs(mnt, exist_ok=True)
+        priv_makedirs(mnt)
         run(["mount", boot_dev, mnt])
         try:
             ok = self._copy_iso_to_mount(iso_path, mnt, distro, distro_key)
@@ -2491,11 +2689,13 @@ class InstallerWindow(Gtk.ApplicationWindow):
         self.log("")
         self.log(f"Disk {disk_path} wiped and reformatted successfully:")
         self.log(f"  Partition 1: {esp_dev}  – EFI System Partition (512 MB)")
-        self.log(f"  Partition 2: {boot_dev} – LINUX_LIVE boot ({boot_gb} GB)")
-        remaining_gb = round(
-            (get_disk_partitions(disk_path)[2] / 1024) - (esp_mib / 1024) - boot_gb, 1)
-        if remaining_gb > 0:
-            self.log(f"  Remaining:   ~{remaining_gb} GB unallocated for Linux installer")
+        self.log(f"  Partition 2: {boot_dev} – LINUX_LIVE boot "
+                 f"({mib_to_display_gb(boot_mib)} GB)")
+        disk_total_mib = get_disk_partitions(disk_path)[2]
+        remaining_mib = disk_total_mib - esp_mib - boot_mib
+        if remaining_mib > 0:
+            self.log(f"  Remaining:   ~{mib_to_display_gb(remaining_mib)} GB "
+                     f"unallocated for Linux installer")
 
         self._boot_part_dev = boot_dev
         self._write_boot_instructions(
@@ -2509,7 +2709,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
     def _copy_iso_to_mount(self, iso_path, mnt, distro, distro_key):
         """Mount ISO read-only and rsync its contents to mnt."""
         iso_mnt = "/mnt/linux_installer_iso_copy"
-        os.makedirs(iso_mnt, exist_ok=True)
+        priv_makedirs(iso_mnt)
 
         hybrid = distro.get("hybrid", False)
 
@@ -2521,7 +2721,6 @@ class InstallerWindow(Gtk.ApplicationWindow):
 
         try:
             if hybrid:
-                # For hybrid ISOs (Fedora), use 7z or isoinfo to extract
                 self.log("Hybrid ISO detected – extracting with 7z…")
                 code, _, err = run(["7z", "x", f"-o{mnt}", iso_path, "-y"],
                                    capture_output=False)
@@ -2532,10 +2731,6 @@ class InstallerWindow(Gtk.ApplicationWindow):
                 self.log("Copying ISO contents to boot partition (10–20 min)…")
                 self.set_status("Copying files…")
 
-                # Detect self-referential symlinks (e.g. ubuntu -> .) that would
-                # cause rsync --copy-links to duplicate the entire tree.
-                # We exclude those but still dereference other symlinks so that
-                # paths like dists/stable -> noble are resolved on FAT32.
                 exclude_args = []
                 try:
                     for entry in os.listdir(iso_mnt):
@@ -2578,55 +2773,43 @@ class InstallerWindow(Gtk.ApplicationWindow):
         for p in cfg_files:
             if not os.path.exists(p):
                 continue
-            with open(p, "r", errors="replace") as f:
-                content = f.read()
+            content = priv_read_file(p)
             patched = re.sub(r"(root=live:(?:CD)?LABEL=)(\S+)", rf"\g<1>{label}", content)
             patched = re.sub(r"(set isolabel=)(\S+)", rf"\g<1>{label}", patched)
             if patched != content:
-                with open(p, "w") as f:
-                    f.write(patched)
+                priv_write_file(p, patched)
                 self.log(f"  Patched: {Path(p).name}")
 
     def _update_grub(self):
         self.log("Updating GRUB…")
         self.set_status("Running GRUB update…")
 
-        # Fedora/RHEL use grub2-mkconfig with EFI path; openSUSE uses
-        # grub2-mkconfig with a different path; Debian/Ubuntu use update-grub.
         candidates = []
 
-        # Fedora / RHEL / CachyOS (dnf-based): grub2-mkconfig writes to the
-        # EFI directory when the system is booted in UEFI mode.
         if os.path.isdir("/sys/firmware/efi"):
-            # Fedora/RHEL UEFI path
             candidates.append((
                 ["grub2-mkconfig", "-o", "/boot/efi/EFI/fedora/grub.cfg"],
                 "Fedora/RHEL UEFI grub2-mkconfig"
             ))
-            # CachyOS / Arch uses /boot/grub/grub.cfg
             candidates.append((
                 ["grub-mkconfig", "-o", "/boot/grub/grub.cfg"],
                 "Arch/CachyOS grub-mkconfig"
             ))
 
-        # Generic grub2-mkconfig (legacy BIOS or fallback UEFI)
         candidates.append((
             ["grub2-mkconfig", "-o", "/boot/grub2/grub.cfg"],
             "grub2-mkconfig (BIOS / generic)"
         ))
-        # Debian / Ubuntu helper script
         candidates.append((
             ["update-grub"],
             "update-grub (Debian/Ubuntu)"
         ))
-        # openSUSE
         candidates.append((
             ["grub2-mkconfig", "-o", "/boot/grub/grub.cfg"],
             "grub2-mkconfig (openSUSE / generic)"
         ))
 
         for cmd, desc in candidates:
-            # Skip if the binary doesn't exist
             if not shutil.which(cmd[0]):
                 continue
             self.log(f"Trying: {desc}  ({' '.join(cmd)})")
@@ -2646,27 +2829,22 @@ class InstallerWindow(Gtk.ApplicationWindow):
         return False
 
     def _set_uefi_boot_entry(self, boot_part_dev, distro_label):
-        """
-        Create a UEFI boot entry for the live boot partition and set it
-        as the first entry in the UEFI boot order using efibootmgr.
-        """
+        """Create a UEFI boot entry for the live boot partition and set it
+        as the first entry in the UEFI boot order using efibootmgr."""
         self.log("Configuring UEFI boot entry…")
         self.set_status("Setting UEFI boot order…")
 
-        # Check if we're on a UEFI system
         if not os.path.isdir("/sys/firmware/efi"):
             self.log("System is not UEFI – skipping UEFI boot entry.")
             self.log("You may need to select the boot device manually from "
                      "your BIOS/legacy boot menu.")
             return
 
-        # Check for efibootmgr
         if not shutil.which("efibootmgr"):
             self.log("efibootmgr not found. Install with: sudo apt install efibootmgr",
                      error=True)
             return
 
-        # Resolve disk and partition number
         disk_dev, part_num = self._resolve_disk_and_part(boot_part_dev)
         if not disk_dev or not part_num:
             self.log(f"Cannot resolve disk/partition for {boot_part_dev}", error=True)
@@ -2674,10 +2852,9 @@ class InstallerWindow(Gtk.ApplicationWindow):
 
         # Find the EFI bootloader on the boot partition
         mnt = "/mnt/linux_installer_efi_check"
-        os.makedirs(mnt, exist_ok=True)
+        priv_makedirs(mnt)
         code, _, _ = run(["mount", "-o", "ro", boot_part_dev, mnt])
         if code != 0:
-            # It might already be mounted from the copy step
             code, mnt_out, _ = run(["findmnt", "-n", "-o", "TARGET", boot_part_dev])
             if code == 0 and mnt_out:
                 mnt = mnt_out.strip()
@@ -2697,11 +2874,9 @@ class InstallerWindow(Gtk.ApplicationWindow):
         for rel_path in efi_search_paths:
             full = os.path.join(mnt, rel_path)
             if os.path.exists(full):
-                # efibootmgr wants the path with backslashes
                 efi_loader = "\\" + rel_path.replace("/", "\\")
                 break
 
-        # Also search case-insensitively
         if not efi_loader:
             efi_dir = os.path.join(mnt, "EFI")
             if os.path.isdir(efi_dir):
@@ -2725,7 +2900,7 @@ class InstallerWindow(Gtk.ApplicationWindow):
 
         entry_name = distro_label.split("–")[0].strip().rstrip('"').strip()
 
-        # Remove any existing entry with the same name to avoid duplicates
+        # Remove any existing entry with the same name
         code, efi_out, _ = run(["efibootmgr", "-v"])
         if code == 0:
             for line in efi_out.splitlines():
@@ -2736,7 +2911,6 @@ class InstallerWindow(Gtk.ApplicationWindow):
                         self.log(f"Removing existing UEFI entry Boot{boot_num}")
                         run(["efibootmgr", "-b", boot_num, "-B"])
 
-        # Create new UEFI boot entry
         self.log(f"Creating UEFI boot entry: \"{entry_name}\"")
         self.log(f"  Disk: {disk_dev}  Partition: {part_num}  Loader: {efi_loader}")
 
@@ -2752,14 +2926,12 @@ class InstallerWindow(Gtk.ApplicationWindow):
             self.log("You may need to select the boot device from the UEFI firmware menu.")
             return
 
-        # Extract the new boot entry number
         new_boot_num = None
         m = re.search(r"Boot(\w{4})\*?\s+" + re.escape(entry_name), out)
         if m:
             new_boot_num = m.group(1)
 
         if not new_boot_num:
-            # Try to find it from the current entries
             code, efi_out, _ = run(["efibootmgr"])
             for line in efi_out.splitlines():
                 if entry_name in line:
@@ -2769,20 +2941,15 @@ class InstallerWindow(Gtk.ApplicationWindow):
                         break
 
         if new_boot_num:
-            # Set as first in boot order
             code, efi_out, _ = run(["efibootmgr"])
-            # Parse current BootOrder
             boot_order = ""
             for line in efi_out.splitlines():
                 if line.startswith("BootOrder:"):
                     boot_order = line.split(":")[1].strip()
                     break
 
-            # Put our entry first
             order_entries = [e.strip() for e in boot_order.split(",") if e.strip()]
-            # Remove our entry if already in the list
             order_entries = [e for e in order_entries if e != new_boot_num]
-            # Prepend it
             new_order = ",".join([new_boot_num] + order_entries)
 
             code, _, err = run(["efibootmgr", "-o", new_order])
@@ -2796,7 +2963,6 @@ class InstallerWindow(Gtk.ApplicationWindow):
             self.log("UEFI entry created but could not determine its boot number.")
             self.log("Check with: sudo efibootmgr -v")
 
-        # Log final boot state
         code, efi_out, _ = run(["efibootmgr"])
         if code == 0:
             self.log("Current UEFI boot entries:")
@@ -2819,7 +2985,7 @@ Linux Installer – Boot Instructions
 Strategy: btrfs partition shrink + new partition
 
 Distro:          {distro_label}
-Boot partition:  {boot_dev}  (FAT32, 7 GB – contains live ISO files)
+Boot partition:  {boot_dev}  (FAT32, {mib_to_display_gb(gb_to_mib(MIN_BOOT_GB))} GB – contains live ISO files)
 Linux partition: {linux_dev}  (unformatted – installer will use this)
 
 To boot the live environment:
@@ -2860,64 +3026,10 @@ def check_deps():
                  "ntfsresize"]:
         if shutil.which(tool) is None:
             missing.append(tool)
-    # update-grub is Debian/Ubuntu-only; on other distros grub2-mkconfig or
-    # grub-mkconfig is used instead. Flag missing only if none are present.
     grub_tools = ["update-grub", "grub2-mkconfig", "grub-mkconfig"]
     if not any(shutil.which(t) for t in grub_tools):
         missing.append("grub tool (one of: update-grub / grub2-mkconfig / grub-mkconfig)")
     return missing
-
-
-def ensure_root():
-    """Re-launch the script as root via pkexec if not already elevated.
-
-    pkexec provides a graphical (Polkit) password dialog, which fits
-    naturally into the GTK workflow.  The current process is replaced
-    seamlessly — from the user's perspective the app simply asks for
-    their password and continues.
-
-    Environment variables DISPLAY and XAUTHORITY (or WAYLAND_DISPLAY)
-    are forwarded so the GTK window can still open under the user's
-    desktop session.
-    """
-    if os.geteuid() == 0:
-        return  # already root
-
-    # Build the command: pkexec env <display‑vars> python3 this_script.py <args>
-    # pkexec sanitises the environment, so we must explicitly pass
-    # the display variables needed for the GUI to work.
-    env_vars = []
-    for var in ("DISPLAY", "XAUTHORITY", "WAYLAND_DISPLAY",
-                "XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS",
-                "HOME", "XDG_CONFIG_HOME", "DCONF_PROFILE"):
-        val = os.environ.get(var)
-        if val:
-            env_vars.append(f"{var}={val}")
-    # Suppress GTK warnings about dconf/ibus/a11y when running as root
-    env_vars.append("GSETTINGS_BACKEND=memory")
-    env_vars.append("GTK_IM_MODULE=none")
-    env_vars.append("NO_AT_BRIDGE=1")
-
-    cmd = ["pkexec", "env"] + env_vars + [sys.executable] + sys.argv
-
-    try:
-        os.execvp("pkexec", cmd)
-    except Exception as e:
-        # If pkexec is missing or the user cancels, fall back to sudo
-        print(f"pkexec failed ({e}), trying sudo…")
-        cmd_sudo = ["sudo",
-                    "GSETTINGS_BACKEND=memory", "GTK_IM_MODULE=none",
-                    "NO_AT_BRIDGE=1",
-                    "--preserve-env=DISPLAY,XAUTHORITY,WAYLAND_DISPLAY,"
-                    "XDG_RUNTIME_DIR,DBUS_SESSION_BUS_ADDRESS,"
-                    "HOME,XDG_CONFIG_HOME,DCONF_PROFILE",
-                    sys.executable] + sys.argv
-        try:
-            os.execvp("sudo", cmd_sudo)
-        except Exception as e2:
-            print(f"Could not obtain root privileges: {e2}", file=sys.stderr)
-            print("Please re-run with:  sudo python3 " + " ".join(sys.argv))
-            sys.exit(1)
 
 
 if __name__ == "__main__":
@@ -2938,8 +3050,6 @@ if __name__ == "__main__":
         else:
             print("All dependencies satisfied.")
         sys.exit(0)
-
-    ensure_root()
 
     app = InstallerApp()
     signal.signal(signal.SIGINT, signal.SIG_DFL)
